@@ -1,11 +1,11 @@
 {
   "tests": [
     {
-      "name": "GET messages direct",
+      "name": "GET without token returns 401",
       "method": "GET",
-      "path": "/?chat_type=direct&user_a=1&user_b=2&since_id=0",
-      "expectedStatus": 200,
-      "expectedBody": {"messages": []},
+      "path": "/?chat_type=direct&peer_id=2&since_id=0",
+      "expectedStatus": 401,
+      "expectedBody": {"error": "Не авторизован"},
       "bodyMatcher": "partial"
     }
   ]
