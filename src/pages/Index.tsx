@@ -98,7 +98,7 @@ function AuthScreen({ onAuth }: { onAuth: (user: User, token: string) => void })
           <div className="w-16 h-16 rounded-2xl bg-primary flex items-center justify-center shadow-lg mb-4">
             <Icon name="Send" size={28} className="text-white" />
           </div>
-          <h1 className="font-display font-extrabold text-2xl tracking-tight">СвязьЛайт</h1>
+          <h1 className="font-display font-extrabold text-2xl tracking-tight">Ishgram</h1>
           <p className="text-muted-foreground text-sm mt-1">Общайтесь с близкими</p>
         </div>
 
@@ -188,6 +188,7 @@ function Messenger({ me, token, onLogout }: { me: User; token: string; onLogout:
   // Voice
   const [recording, setRecording]   = useState(false);
   const [recSec, setRecSec]         = useState(0);
+  const recSecRef = useRef(0); // fix closure bug
   const mrRef     = useRef<MediaRecorder|null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const recTimer  = useRef<ReturnType<typeof setInterval>|null>(null);
@@ -303,15 +304,39 @@ function Messenger({ me, token, onLogout }: { me: User; token: string; onLogout:
     } catch { /* optimistic already shown */ }
   };
 
-  // Upload file
+  // Upload file — snapshot activeChat to avoid stale closure
   const uploadAndSend = (f: File, kind: string) => {
+    const chatSnap = activeChatRef.current;
+    if (!chatSnap) { alert('Сначала откройте чат'); return; }
     const reader = new FileReader();
     reader.onload = async () => {
-      const b64 = (reader.result as string).split(',')[1];
-      const r   = await fetch(API_UPLOAD, { method:'POST', headers: H,
-                               body: JSON.stringify({ data: b64, filename: f.name, mime: f.type }) });
-      const d   = parse(await r.json()) as { url?: string };
-      if (d.url) sendMsg('', { msg_type: kind as Msg['msg_type'], file_url: d.url, file_name: f.name });
+      try {
+        const b64 = (reader.result as string).split(',')[1];
+        const r   = await fetch(API_UPLOAD, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: b64, filename: f.name, mime: f.type }),
+        });
+        const d = parse(await r.json()) as { url?: string; error?: string };
+        if (!d.url) { alert('Ошибка загрузки файла'); return; }
+        // use sendMsg with current activeChat via ref
+        const time = new Date().toLocaleTimeString('ru', { hour:'2-digit', minute:'2-digit' });
+        const opt: Msg = { id: Date.now(), from_user_id: me.id, sender_name: me.name,
+          sender_avatar: me.avatar_url, msg_type: kind, text: '', time, mine: true,
+          file_url: d.url, file_name: f.name };
+        setMessages(prev => [...prev, opt]);
+        const body: Record<string, unknown> = {
+          chat_type: chatSnap.chatType, msg_type: kind, text: '',
+          file_url: d.url, file_name: f.name,
+          ...(chatSnap.chatType === 'direct' ? { to_user_id: chatSnap.peerId } : { group_id: chatSnap.groupId }),
+        };
+        const resp = await fetch(API_MESSAGES, { method:'POST', headers: H, body: JSON.stringify(body) });
+        const rd = parse(await resp.json()) as { id?: number };
+        if (rd.id) {
+          lastIdRef.current = Math.max(lastIdRef.current, rd.id);
+          setMessages(prev => prev.map(m => m.id === opt.id ? { ...m, id: rd.id! } : m));
+        }
+      } catch (e) { alert('Ошибка отправки файла'); }
     };
     reader.readAsDataURL(f);
   };
@@ -325,31 +350,72 @@ function Messenger({ me, token, onLogout }: { me: User; token: string; onLogout:
   const startRec = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mr = new MediaRecorder(stream);
+      // prefer webm, fallback to whatever browser supports
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm'
+        : MediaRecorder.isTypeSupported('audio/mp4')  ? 'audio/mp4'
+        : '';
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       chunksRef.current = [];
+      recSecRef.current = 0;
       mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       mr.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type:'audio/webm' });
+        const chatSnap = activeChatRef.current;
+        const durSec   = recSecRef.current;
+        const blob = new Blob(chunksRef.current, { type: mr.mimeType || 'audio/webm' });
         const localUrl = URL.createObjectURL(blob);
         stream.getTracks().forEach(t => t.stop());
-        const dur = fmt(recSec);
-        // upload then send
+        const dur = fmt(durSec);
+
         const reader = new FileReader();
         reader.onload = async () => {
-          const b64 = (reader.result as string).split(',')[1];
-          const r   = await fetch(API_UPLOAD, { method:'POST', headers: H,
-                                   body: JSON.stringify({ data: b64, filename:'voice.webm', mime:'audio/webm' }) });
-          const d   = parse(await r.json()) as { url?: string };
-          sendMsg('', { msg_type:'voice', file_url: d.url || localUrl, voiceUrl: d.url || localUrl, voice_dur: dur });
+          try {
+            const b64 = (reader.result as string).split(',')[1];
+            const ext  = (mr.mimeType || 'audio/webm').includes('mp4') ? 'mp4' : 'webm';
+            const r = await fetch(API_UPLOAD, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ data: b64, filename: `voice.${ext}`, mime: mr.mimeType || 'audio/webm' }),
+            });
+            const d = parse(await r.json()) as { url?: string };
+            const voiceUrl = d.url || localUrl;
+
+            // Build message manually using chatSnap (not stale activeChat)
+            if (!chatSnap) return;
+            const time = new Date().toLocaleTimeString('ru', { hour:'2-digit', minute:'2-digit' });
+            const opt: Msg = { id: Date.now(), from_user_id: me.id, sender_name: me.name,
+              sender_avatar: me.avatar_url, msg_type:'voice', text:'', time, mine:true,
+              file_url: voiceUrl, voiceUrl, voice_dur: dur };
+            setMessages(prev => [...prev, opt]);
+
+            const body: Record<string, unknown> = {
+              chat_type: chatSnap.chatType, msg_type:'voice', text:'',
+              file_url: voiceUrl, voice_dur: dur,
+              ...(chatSnap.chatType==='direct' ? { to_user_id: chatSnap.peerId } : { group_id: chatSnap.groupId }),
+            };
+            const resp = await fetch(API_MESSAGES, { method:'POST', headers: H, body: JSON.stringify(body) });
+            const rd = parse(await resp.json()) as { id?: number };
+            if (rd.id) {
+              lastIdRef.current = Math.max(lastIdRef.current, rd.id);
+              setMessages(prev => prev.map(m => m.id === opt.id ? { ...m, id: rd.id! } : m));
+            }
+          } catch { /* use local url fallback */ }
         };
         reader.readAsDataURL(blob);
         setRecSec(0);
+        recSecRef.current = 0;
       };
       mr.start();
       mrRef.current = mr;
       setRecording(true);
-      recTimer.current = setInterval(() => setRecSec(s => s+1), 1000);
-    } catch { alert('Нет доступа к микрофону'); }
+      recTimer.current = setInterval(() => {
+        recSecRef.current += 1;
+        setRecSec(recSecRef.current);
+      }, 1000);
+    } catch {
+      alert('Нет доступа к микрофону. Разрешите доступ в настройках браузера.');
+    }
   };
 
   const stopRec = () => {
